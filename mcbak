@@ -1,0 +1,78 @@
+#!/bin/bash
+BASE="$HOME/bedrock-server"
+DEST="$BASE/mcbak-latest"
+BUP_DIR="$BASE/mcbak-bup"
+LOGFILE="$BASE"/mclog
+MAX_RETRIES=15  # How many times to try to grab the snapshot metadata
+# Log looks like:
+# Data saved. Files are now ready to be copied.
+# Bedrock level/db/000099.ldb:1540940, Bedrock level/db/CURRENT:16, Bedrock level/db/MANIFEST-000080:1194, Bedrock level/db/000097.log:3402440, Bedrock level/level.dat:2544, Bedrock level/level.dat_old:2544, Bedrock level/levelname.txt:13
+SAVED_PATTERN='^Data saved. Files are now ready to be copied'
+INTERVAL=600    # Every 10 minutes
+#INTERVAL=3600   # Hourly
+#INTERVAL=86400  # Daily
+
+while true ; do
+    rm "$LOGFILE"
+
+    screen -S minecraft -X log 
+    screen -S minecraft -X stuff $'save hold\n' 
+
+    sleep 5
+
+    if [ -f "$LOGFILE" ] ; then
+        screen -S minecraft -X stuff $'save query\n' 
+        attempt=0
+        while ((attempt < MAX_RETRIES)) && ! grep -q "$SAVED_PATTERN" "$LOGFILE" ; do
+            sleep 2
+            ((attempt++))
+        done
+
+        if grep -q "$SAVED_PATTERN" "$LOGFILE" ; then
+            # Line of after the matching line contains the CSV params
+            params=$(grep -A1 $"SAVED_PATTERN" "$LOGFILE" | tail -n1)
+            echo "$params"
+            echo "copying..."
+
+            # Save IFS so we can restore it. This monster from:
+            # https://unix.stackexchange.com/questions/640062/how-to-temporarily-save-and-restore-the-ifs-variable-properly
+            unset saved_IFS
+            [ -n "${IFS+set}" ] && saved_IFS=$IFS
+
+            # Change IFS to read params which are CSV
+            IFS=,
+            read -ra values <<< "$params"
+            for v in "${values[@]}" ; do
+                param=$(grep -o "\S.*\S" <<< "$v")
+                filename=$(grep -oP '.+(?=:)' <<< "$param")
+                size=$(grep -oP '(?<=:)\d+' <<< "$param")
+                if [ "$filename" == "" -o "$size" == "" ] ; then
+                    echo "Could not parse filename and size from '""$param""'"
+                else
+                    echo "Removing previous backup if any..."
+                    rm "$DEST"/*
+                    echo "Copying $size bytes of $filename..."
+                    mkdir -p "$DEST/$(dirname "$filename")" && dd if="$BASE/worlds/$filename" of="$DEST/$filename" iflag=count_bytes bs=8M count=$size
+                fi
+            done
+
+            # Restore IFS
+            unset IFS
+            [ -n "${saved_IFS+set}" ] && { IFS=$saved_IFS; unset saved_IFS; }
+
+            # Commit to bup
+            export BUP_DIR
+            bup index "$DEST" && bup save -n mcbak "$DEST"
+
+        else
+            echo "No backup parameters found"
+        fi
+    else
+        echo "Screen did not appear to log to $LOGFILE"
+    fi
+
+    screen -S minecraft -X log 
+    screen -S minecraft -X stuff $'save resume\n' 
+
+    sleep $INTERVAL
+done

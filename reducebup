@@ -1,0 +1,57 @@
+#!/usr/bin/python3
+from subprocess import Popen, PIPE, STDOUT
+import re
+import sys
+
+from rich.progress import Progress
+from rich.console import Console
+from rich.theme import Theme
+
+DAYS_TO_KEEP_IN_FULL = 7  # Number of (most recent) days to keep all revisions
+
+custom_theme = Theme({
+    "bar.back": "dim steel_blue",
+    "bar.complete": "steel_blue",
+    "bar.finished": "green1",
+})
+console = Console(theme=custom_theme)
+
+bup_dir = sys.argv[1]
+
+console.print("This script will take a very long time to run, but your bup repository should be much quicker afterwards.")
+console.print("You are likely to see mmap memory allocation issues if vm.max_count is set to its default of 65535. Setting it to a higher value (e.g. 262144) should fix this.")
+
+with Progress(console=console) as progress:
+    progress.print("Listing backups...")
+    p = Popen(["bup", "-d", bup_dir, "ls", "mcbak"], stdout=PIPE)
+    stdout = p.communicate()[0].decode("utf-8")
+
+    entriesByDate = {}
+
+    for line in stdout.split("\n"):
+        m = re.match("^(\d{4}-\d{2}-\d{2})-(\d{6})$", line)
+        if m:
+            entriesByDate.setdefault(m.group(1), []).append(m.group(0))
+        else:
+            progress.print(f"WARNING: skipping non-matching entry '{line}'")
+
+    taskDays = progress.add_task("Days...", total=len(entriesByDate))
+    for day, entries in [*reversed(entriesByDate.items())][DAYS_TO_KEEP_IN_FULL:]:
+        progress.print(f"Assessing {day}")
+        entries.sort()
+        keep = entries[-1]
+        toDelete = entries[:-1]
+
+        if toDelete:
+            progress.print(f"Deleting {len(toDelete)} entries")
+            # Capture to go through progress.print, but mainly to ensure bup doesn't treat output as tty
+            with Popen(["bup", "-d", bup_dir, "rm", "--unsafe"] + [f"mcbak/{toDel}" for toDel in toDelete], stdout=PIPE, stderr=STDOUT) as p:
+                for line in p.stdout:
+                    progress.print(line.decode("utf8").rstrip("\n"))
+
+        progress.update(taskDays, advance=1)
+
+    progress.print(f"Running `bup gc`...")
+    with Popen(["bup", "-d", bup_dir, "gc", "--unsafe"], stdout=PIPE, stderr=STDOUT) as p:
+        for line in p.stdout:
+            progress.print(line.decode("utf8").rstrip("\n"))

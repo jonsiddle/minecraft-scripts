@@ -1,0 +1,5 @@
+#!/bin/bash
+BASE="$HOME/bedrock-server"
+LOGFILE="$BASE"/mclog
+
+cd "$BASE" ; screen -S minecraft -Logfile mclog ./bedrock_server
