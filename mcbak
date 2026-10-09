@@ -3,6 +3,8 @@
 # Sub-processes should die with us
 trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
 
+ulimit -n 10240  # bup currently uses lots of little idx files which are mmapped. They have plans to address this.
+
 if [ $# -lt 4 ] ; then
     echo 'SYNTAX: mcbak mode server_name world_base backup_base [interval]'
     echo 'e.g: '
@@ -73,11 +75,6 @@ function send_server_command () {
 }
 
 function backup () {
-    echo BACKUP: $1
-
-    echo "Removing previous backup if any..."
-    rm -rf "$DEST"/*
-
     # Save IFS so we can restore it. This monster from:
     # https://unix.stackexchange.com/questions/640062/how-to-temporarily-save-and-restore-the-ifs-variable-properly
     unset saved_IFS
@@ -130,8 +127,13 @@ while true ; do
         if grep -q "$SAVED_PATTERN" "$LOGFILE" ; then
             # Line of after the matching line contains the CSV params
             params=$(grep -A1 "$SAVED_PATTERN" "$LOGFILE" | tail -n1)
+            echo "Backup parameters found:"
             echo "$params"
-            echo "copying..."
+
+            echo "Removing previous backup from $DEST if any..."
+            rm -rf "$DEST"/*
+
+            echo "Copying..."
 
             backup "$params"
 
