@@ -1,27 +1,119 @@
 #!/bin/bash
-BASE="$HOME/bedrock-server"
+
+# Sub-processes should die with us
+trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
+
+if [ $# -ne 4 ] ; then
+    echo 'SYNTAX: mcbak mode server_name world_base backup_base'
+    echo 'e.g: '
+    echo '    $ mcbak docker minecraft-s /srv/minecraft-data/server-a/worlds /srv/backups/mc-world-a'
+    echo 'e.g: '
+    echo '    $ mcbak screen minecraft $HOME/bedrock-server/worlds $HOME/bedrock-server'
+    exit 1
+fi
+
+SERVER_MODE="$1" # screen or docker
+SERVER_NAME="$2" # name of screen session or docker container
+WORLDS="$3"
+BASE="$4"
+
 DEST="$BASE/mcbak-latest"
 BUP_DIR="$BASE/mcbak-bup"
-LOGFILE="$BASE"/mclog
+LOGFILE="$BASE/mcbak-log"
 MAX_RETRIES=15  # How many times to try to grab the snapshot metadata
 # Log looks like:
 # Data saved. Files are now ready to be copied.
 # Bedrock level/db/000099.ldb:1540940, Bedrock level/db/CURRENT:16, Bedrock level/db/MANIFEST-000080:1194, Bedrock level/db/000097.log:3402440, Bedrock level/level.dat:2544, Bedrock level/level.dat_old:2544, Bedrock level/levelname.txt:13
-SAVED_PATTERN='^Data saved. Files are now ready to be copied'
+SAVED_PATTERN='^\(\[[^]]*\] \)\?Data saved. Files are now ready to be copied'
 INTERVAL=600    # Every 10 minutes
 #INTERVAL=3600   # Hourly
 #INTERVAL=86400  # Daily
 
+logging_pid=-1
+
+function start_log () {
+    if [ "$SERVER_MODE" == "screen" ] ; then
+        screen -S "$SERVER_NAME" -X log 
+    elif [ "$SERVER_MODE" == "docker" ] ; then
+        if [ "$logging_pid" -ne -1 ] ; then
+            stop_log
+        fi
+        docker logs "$SERVER_NAME" -n0 --follow >> "$LOGFILE" & logging_pid=$!
+    else
+        echo "Unrecognised server mode: '$SERVER_MODE'"
+    fi
+}
+
+function stop_log () {
+    if [ "$SERVER_MODE" == "screen" ] ; then
+        screen -S "$SERVER_NAME" -X log 
+    elif [ "$SERVER_MODE" == "docker" ] ; then
+        if [ "$logging_pid" -ne -1 ] ; then
+            kill $logging_pid
+            logging_pid=-1
+        fi
+    else
+        echo "Unrecognised server mode: '$SERVER_MODE'"
+    fi
+}
+
+function send_server_command () {
+    echo "SENDING SERVER COMMAND $1"
+    if [ "$SERVER_MODE" == "screen" ] ; then
+        screen -S "$SERVER_NAME" -X stuff "$1"$'\n'
+    elif [ "$SERVER_MODE" == "docker" ] ; then
+        docker exec "$SERVER_NAME" send-command "$1"
+    else
+        echo "Unrecognised server mode: '$SERVER_MODE'"
+    fi
+}
+
+function backup () {
+    echo BACKUP: $1
+    # Save IFS so we can restore it. This monster from:
+    # https://unix.stackexchange.com/questions/640062/how-to-temporarily-save-and-restore-the-ifs-variable-properly
+    unset saved_IFS
+    [ -n "${IFS+set}" ] && saved_IFS=$IFS
+
+    # Change IFS to read params which are CSV
+    IFS=,
+    read -ra values <<< "$1"
+    for v in "${values[@]}" ; do
+        param=$(grep -o "\S.*\S" <<< "$v")
+        filename=$(grep -oP '.+(?=:)' <<< "$param")
+        size=$(grep -oP '(?<=:)\d+' <<< "$param")
+        if [ "$filename" == "" -o "$size" == "" ] ; then
+            echo "Could not parse filename and size from '""$param""'"
+        else
+            echo "Removing previous backup if any..."
+            rm -rf "$DEST"/*
+            echo "Copying $size bytes of $filename..."
+            mkdir -p "$DEST/$(dirname "$filename")" && dd if="$WORLDS/$filename" of="$DEST/$filename" iflag=count_bytes bs=8M count=$size
+        fi
+    done
+
+    # Restore IFS
+    unset IFS
+    [ -n "${saved_IFS+set}" ] && { IFS=$saved_IFS; unset saved_IFS; }
+}
+
+function bup_commit () {
+    # Commit to bup
+    export BUP_DIR
+    bup index "$DEST" && bup save -n mcbak "$DEST"
+}
+
 while true ; do
     rm "$LOGFILE"
 
-    screen -S minecraft -X log 
-    screen -S minecraft -X stuff $'save hold\n' 
+    start_log
+
+    send_server_command "save hold"
 
     sleep 5
 
     if [ -f "$LOGFILE" ] ; then
-        screen -S minecraft -X stuff $'save query\n' 
+        send_server_command "save query"
         attempt=0
         while ((attempt < MAX_RETRIES)) && ! grep -q "$SAVED_PATTERN" "$LOGFILE" ; do
             sleep 2
@@ -30,40 +122,14 @@ while true ; do
 
         if grep -q "$SAVED_PATTERN" "$LOGFILE" ; then
             # Line of after the matching line contains the CSV params
-            params=$(grep -A1 $"SAVED_PATTERN" "$LOGFILE" | tail -n1)
+            params=$(grep -A1 "$SAVED_PATTERN" "$LOGFILE" | tail -n1)
             echo "$params"
             echo "copying..."
 
-            # Save IFS so we can restore it. This monster from:
-            # https://unix.stackexchange.com/questions/640062/how-to-temporarily-save-and-restore-the-ifs-variable-properly
-            unset saved_IFS
-            [ -n "${IFS+set}" ] && saved_IFS=$IFS
+            backup "$params"
 
-            # Change IFS to read params which are CSV
-            IFS=,
-            read -ra values <<< "$params"
-            for v in "${values[@]}" ; do
-                param=$(grep -o "\S.*\S" <<< "$v")
-                filename=$(grep -oP '.+(?=:)' <<< "$param")
-                size=$(grep -oP '(?<=:)\d+' <<< "$param")
-                if [ "$filename" == "" -o "$size" == "" ] ; then
-                    echo "Could not parse filename and size from '""$param""'"
-                else
-                    echo "Removing previous backup if any..."
-                    rm "$DEST"/*
-                    echo "Copying $size bytes of $filename..."
-                    mkdir -p "$DEST/$(dirname "$filename")" && dd if="$BASE/worlds/$filename" of="$DEST/$filename" iflag=count_bytes bs=8M count=$size
-                fi
-            done
 
-            # Restore IFS
-            unset IFS
-            [ -n "${saved_IFS+set}" ] && { IFS=$saved_IFS; unset saved_IFS; }
-
-            # Commit to bup
-            export BUP_DIR
-            bup index "$DEST" && bup save -n mcbak "$DEST"
-
+            bup_commit
         else
             echo "No backup parameters found"
         fi
@@ -71,8 +137,9 @@ while true ; do
         echo "Screen did not appear to log to $LOGFILE"
     fi
 
-    screen -S minecraft -X log 
-    screen -S minecraft -X stuff $'save resume\n' 
+    stop_log
+
+    send_server_command "save resume"
 
     sleep $INTERVAL
 done
